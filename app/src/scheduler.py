@@ -1,11 +1,12 @@
 from __future__ import annotations
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import time
 import heapq
 import threading
 from dataclasses import dataclass, field
 from typing import Callable, Any, Optional, Tuple
 
-# TODO allow scheduler to create and run independant threading workers
 # TODO create function for alarm style timing (everyday at 11:00, every monday at 8 etc) 
 
 @dataclass(order=True)
@@ -21,6 +22,80 @@ class _ScheduledItem:
 
 
 class Scheduler:
+    def __init__(self) -> None:
+        self._cv = threading.Condition()
+        self._pq: list[_ScheduledItem] = []
+        self._seq = 0
+        self._stop = False
+        self._jobs: dict[str, _ScheduledItem] = {}
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+
+    # ---------- calendar helpers ----------
+    @staticmethod
+    def _next_daily(hour: int, minute: int = 0, second: int = 0, tz: Optional[str] = None) -> float:
+        zone = ZoneInfo(tz) if tz else None
+        now = datetime.now(zone)
+        target = now.replace(hour=hour, minute=minute, second=second, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        return target.timestamp()
+
+    @staticmethod
+    def _next_weekly(
+        weekday: int,  # 0=Monday
+        hour: int,
+        minute: int = 0,
+        second: int = 0,
+        tz: Optional[str] = None,
+    ) -> float:
+        zone = ZoneInfo(tz) if tz else None
+        now = datetime.now(zone)
+        days_ahead = (weekday - now.weekday()) % 7
+        target = (now + timedelta(days=days_ahead)).replace(
+            hour=hour, minute=minute, second=second, microsecond=0
+        )
+        if target <= now:
+            target += timedelta(days=7)
+        return target.timestamp()
+
+    # ---------- public calendar API ----------
+    def daily_at(
+        self,
+        hour: int,
+        minute: int,
+        func: Callable[..., Any],
+        *args: Any,
+        tz: Optional[str] = None,
+        job_id: Optional[str] = None,
+        **kwargs: Any,
+    ) -> str:
+        def wrapper():
+            func(*args, **kwargs)
+            next_run = self._next_daily(hour, minute, 0, tz)
+            self.schedule_at(next_run, wrapper, job_id=job_id)
+
+        first_run = self._next_daily(hour, minute, 0, tz)
+        return self.schedule_at(first_run, wrapper, job_id=job_id)
+
+    def weekly_at(
+        self,
+        weekday: int,  # 0=Monday
+        hour: int,
+        minute: int,
+        func: Callable[..., Any],
+        *args: Any,
+        tz: Optional[str] = None,
+        job_id: Optional[str] = None,
+        **kwargs: Any,
+    ) -> str:
+        def wrapper():
+            func(*args, **kwargs)
+            next_run = self._next_weekly(weekday, hour, minute, 0, tz)
+            self.schedule_at(next_run, wrapper, job_id=job_id)
+
+        first_run = self._next_weekly(weekday, hour, minute, 0, tz)
+        return self.schedule_at(first_run, wrapper, job_id=job_id)
+        
     def __init__(self) -> None:
         self._cv = threading.Condition()
         self._pq: list[_ScheduledItem] = []
@@ -119,12 +194,16 @@ class Scheduler:
                 if item.cancelled:
                     continue
 
-            # run outside lock
-            try:
-                item.func(*item.args, **item.kwargs)
-            except Exception:
-                # replace with logging if desired
-                pass
+            # run outside lock: launch each job in its own thread
+            def job_wrapper():
+                try:
+                    item.func(*item.args, **item.kwargs)
+                except Exception:
+                    # replace with logging if desired
+                    pass
+
+            t = threading.Thread(target=job_wrapper, daemon=True)
+            t.start()
 
             # reschedule repeating jobs
             if item.interval and not item.cancelled:
